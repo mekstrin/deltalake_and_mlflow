@@ -44,53 +44,92 @@ lab_data/
 ## Архитектура пайплайна
 
 ```
-Raw CSV
-      │
-      ▼  append per day
-  BRONZE (Delta)          ← schema_mode=merge (schema evolution)
-      │
-      ▼  MERGE by flight key
-  SILVER (Delta)          ← partition_by=["year","month","day"]
-      │
-      ├──▶ GOLD/analytics  ← агрегаты по airport/carrier/hour/season
-      │
-      └──▶ GOLD/features   ← ML feature table (ARR_DELAY, is_delayed)
-                │
-                ▼
-            LightGBM / sklearn   ──▶  MLflow
+Raw CSV (Kaggle)
+        │
+        ▼
+┌─────────────────────────────────────────────────────────┐
+│  BRONZE LAYER                                            │
+│  Задача: принять сырые данные день за днём, сохранить     │
+│          историю загрузок в версиях Delta                │
+│  Формат: 31 append-батч → 31 версия таблицы              │
+│                                                         │
+│  Преобразования:                                         │
+│   • schema_override для 20+ колонок (int/float/str)     │
+│   • null_values=["", "NA", "N/A"] → null                │
+│   • filter по дате (только day=X)                        │
+│   • добавлены служебные поля:                           │
+│       source_day  — дата среза                          │
+│       source_month — месяц среза                        │
+│       load_ts     — timestamp загрузки (UTC now)        │
+└─────────────────────────────────────────────────────────┘
+        │
+        ▼
+┌─────────────────────────────────────────────────────────┐
+│  SILVER LAYER                                            │
+│  Задача: очистить данные, обогатить признаками,          │
+│          убрать дубли при повторных запусках (MERGE)     │
+│  Партиции: year/month/day                               │
+│                                                         │
+│  Преобразования:                                         │
+│   1. Отфильтровать отменённые рейсы (Cancelled != 1)    │
+│   2. Убрать строки с null в ключевых полях:              │
+│      ArrDelay, DepTime, Origin, Dest, FlightDate         │
+│   3. Удалить выбросы ArrDelay                              │
+│      диапазон: [-60 мин, +600 мин] (10 часов)             │
+│      (config: ARR_DELAY_MIN=-60, ARR_DELAY_MAX=600)        │
+│   4. Нормализация текста (strip + UPPER):               │
+│      IATA_Code_Operating_Airline, Origin, Dest           │
+│   5. Парсинг FlightDate → FlightDate_parsed             │
+│   6. Извлечение временных признаков:                    │
+│      year, month, day, day_of_week, hour, season        │
+│   7. Построение route = Origin + "-" + Dest             │
+│   8. Ключ MERGE:                                        │
+│      (FlightDate, IATA_Code_Operating_Airline,           │
+│       Origin, Dest, DepTime, source_day)                │
+│      — при повторном запуске обновляет, не дублирует     │
+└─────────────────────────────────────────────────────────┘
+        │
+   ┌────┴───────────────────────────────────────────┐
+   ▼                                                  ▼
+┌────────────────────────┐              ┌─────────────────────────┐
+│  GOLD/analytics         │              │  GOLD/features           │
+│  Агрегаты по задержкам │              │  Feature table для ML    │
+│                         │              │                         │
+│  Группировка по:        │              │  Фичи (X):              │
+│   • Origin              │              │   carrier, origin, dest  │
+│   • IATA_Code_...       │              │   route, year/month/day │
+│   • hour                │              │   day_of_week, hour      │
+│   • season              │              │   season, distance      │
+│   • year/month/day      │              │   DepDelay, TaxiOut      │
+│                         │              │   CRSElapsedTime         │
+│  Агрегации:             │              │                         │
+│   avg_arr_delay         │              │  Целевые переменные (y): │
+│   median_arr_delay      │              │   ArrDelay (регрессия)   │
+│   std_arr_delay         │              │   is_delayed (бинарная,  │
+│   flight_count          │              │    > 15 мин = 1)        │
+│   pct_delayed (>15мин)  │              │                         │
+└────────────────────────┘              └─────────────────────────┘
+        │                                        │
+        ▼                                        ▼
+   Аналитические запросы              LightGBM / sklearn → MLflow
+   (BI, дашборды)                    (RMSE, MAE, R², F1, ROC-AUC)
 ```
 
-## Bronze Layer
+### Детализация по слоям
 
-Каждый день января 2024 года загружается отдельным батчем в `mode="append"`, что создаёт
-31 версию Delta (версия 0 = 1 января, версия 30 = 31 января).
-Имитирует реальный инкрементальный приём данных (день за днём).
+| Слой | Вход | Выход | Ключевые операции |
+|------|------|-------|-------------------|
+| **Bronze** | CSV (Kaggle) | Delta (append, 31 версия) | schema_override, null_values, фильтр по дате, служебные колонки |
+| **Silver** | Bronze Delta | Delta (партиционированный) | filter cancelled/nulls/outliers, normalize text, derive temporal features (year/month/day/hour/season/route), MERGE upsert |
+| **Gold/analytics** | Silver Delta | Delta (агрегаты) | group_by + mean/median/std/count по airport/carrier/hour/season |
+| **Gold/features** | Silver Delta | Delta (фичи+таргеты) | select фичей, is_delayed бинаризация |
 
-```python
-for day in DAYS:
-    df = load_day(day)
-    write_deltalake(BRONZE_PATH, df, mode="append", schema_mode="merge")
-```
+### Зачем нужен каждый слой
 
-## Silver Layer: MERGE
-
-При повторном запуске пайплайна данные **обновляются**, а не дублируются.
-Ключ MERGE: `(FlightDate, IATA_Code_Operating_Airline, Origin, Dest, DepTime, source_day)`.
-
-```python
-dt.merge(source=df, predicate=predicate, source_alias="s", target_alias="t")
-  .when_matched_update_all()
-  .when_not_matched_insert_all()
-  .execute()
-```
-
-## Партиционирование Silver
-
-Партиции `["year", "month", "day"]` выбраны по следующим соображениям:
-
-- **Типичные запросы** фильтруют по временному диапазону (например, задержки за день, или за несколько дней).
-  Polars/DeltaLake пропускают нерелевантные партиции целиком.
-- **Датасет содержит данные только за январь 2024** — при менее гранулярном выборе партициирования продемонстировать отсечение по партициям не вышло бы.
+- **Bronze**: сырые данные сохранены как есть — можно откатиться к любой версии (time travel) или добавить новые дни без перезаписи
+- **Silver**: deduplication (MERGE) + партиционирование = быстрые запросы по дате; очистка гарантирует качество аналитики
+- **Gold/analytics**: pre-aggregated данные для BI — не нужно сканировать весь объём при каждом запросе
+- **Gold/features**: ML-ready таблица — отфильтрована от null, содержит таргеты, готова для train/test split
 
 ## Polars `.explain()` — пример с пушдаунами
 

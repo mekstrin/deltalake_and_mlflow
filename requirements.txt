@@ -1,0 +1,11 @@
+polars==1.40.1
+deltalake==1.5.0
+mlflow==3.11.1
+scikit-learn==1.6.1
+lightgbm==4.6.0
+pandas==2.2.3
+pyarrow==23.0.0
+matplotlib==3.10.1
+seaborn==0.13.2
+jupyter==1.1.1
+nbformat==5.10.4

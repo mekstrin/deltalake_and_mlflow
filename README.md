@@ -34,8 +34,6 @@ lab_data/
 │   ├── delta_utils.py
 │   ├── ml.py
 │   └── pipeline.py
-├── notebooks/
-│   └── eda.ipynb
 ├── logs/
 ├── mlflow/                   # MLflow artifacts
 ├── docker-compose.yml
